@@ -1,0 +1,1328 @@
+#!/usr/bin/env python3
+"""
+MP Magic Mouse Centered
+Cross-platform mouse cursor centering utility & background service.
+Supports macOS, Windows, and Linux (both X11 and Wayland).
+"""
+
+import sys
+import os
+import time
+import json
+import wave
+import math
+import struct
+import signal
+import shutil
+import argparse
+import subprocess
+import threading
+import ctypes
+from typing import List, Dict, Any, Tuple, Optional
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_PATH = os.path.abspath(__file__)
+ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
+SOUND_FILE = os.path.join(ASSETS_DIR, "happy_alert.wav")
+LOCAL_CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+
+def get_config_path() -> str:
+    """Returns local config if writable or already present; otherwise user config dir."""
+    if os.path.exists(LOCAL_CONFIG_FILE):
+        return LOCAL_CONFIG_FILE
+    try:
+        with open(LOCAL_CONFIG_FILE, "a"):
+            pass
+        return LOCAL_CONFIG_FILE
+    except (OSError, PermissionError):
+        pass
+
+    if sys.platform == "win32":
+        app_data = os.environ.get("APPDATA", os.path.expanduser("~"))
+        base_dir = os.path.join(app_data, "MP_Magic_Mouse_Centered")
+    else:
+        base_dir = os.path.expanduser("~/.config/mp_magic_mouse_centered")
+    os.makedirs(base_dir, exist_ok=True)
+    return os.path.join(base_dir, "config.json")
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "target_monitor": "primary",
+    "first_run_completed": False,
+    "service_installed": False,
+    "sound_enabled": True,
+    "sound_on_hotkey": False,
+    "shortcut": "Alt+C"
+}
+
+def load_config() -> Dict[str, Any]:
+    config_path = get_config_path()
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                for k, v in DEFAULT_CONFIG.items():
+                    if k not in cfg:
+                        cfg[k] = v
+                return cfg
+        except Exception:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(config: Dict[str, Any]) -> bool:
+    config_path = get_config_path()
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4)
+        return True
+    except Exception:
+        return False
+
+# ============================================================================
+# AUDIO GENERATION & PLAYBACK
+# ============================================================================
+
+def ensure_sound_file() -> str:
+    """Generates the cheerful chime sound if not already present."""
+    if os.path.exists(SOUND_FILE):
+        return SOUND_FILE
+
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    sample_rate = 44100
+    notes = [
+        (1046.50, 0.075, 0.50), # C6
+        (1318.51, 0.075, 0.60), # E6
+        (1567.98, 0.075, 0.70), # G6
+        (2093.00, 0.380, 0.85), # C7
+    ]
+    samples = []
+    for freq, dur, vol in notes:
+        n = int(sample_rate * dur)
+        for i in range(n):
+            t = i / sample_rate
+            attack = min(1.0, t / 0.003)
+            decay = math.exp(-3.8 * (t / dur))
+            env = attack * decay * vol
+            val = math.sin(2 * math.pi * freq * t) + 0.22 * math.sin(4 * math.pi * freq * t)
+            sample = int(val * env * 32767 * 0.75)
+            samples.append(max(-32767, min(32767, sample)))
+
+    try:
+        with wave.open(SOUND_FILE, "wb") as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(sample_rate)
+            f.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+    except Exception:
+        pass
+    return SOUND_FILE
+
+def play_happy_sound():
+    """Plays the generated happy alert sound without logging or console output."""
+    sound_path = ensure_sound_file()
+    if not os.path.exists(sound_path):
+        return
+
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["afplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif sys.platform == "win32":
+            try:
+                import winsound
+                winsound.PlaySound(sound_path, winsound.SND_FILENAME)
+            except Exception:
+                subprocess.run(
+                    ["powershell", "-c", f'(New-Object Media.SoundPlayer "{sound_path}").PlaySync()'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+        else: # Linux
+            for player in ["aplay", "paplay", "pw-play", "canberra-gtk-play", "ffplay"]:
+                if shutil.which(player):
+                    cmd = [player, "-f", sound_path] if player == "canberra-gtk-play" else [player, sound_path]
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    break
+    except Exception:
+        pass
+
+# ============================================================================
+# MONITOR DETECTION & MOUSE CENTERING
+# ============================================================================
+
+def get_monitors_macos() -> List[Dict[str, Any]]:
+    class CGPoint(ctypes.Structure):
+        _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
+    class CGSize(ctypes.Structure):
+        _fields_ = [('width', ctypes.c_double), ('height', ctypes.c_double)]
+    class CGRect(ctypes.Structure):
+        _fields_ = [('origin', CGPoint), ('size', CGSize)]
+
+    try:
+        cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        cg.CGDisplayBounds.restype = CGRect
+        cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+        cg.CGGetActiveDisplayList.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
+
+        main_id = cg.CGMainDisplayID()
+        count = ctypes.c_uint32(0)
+        displays = (ctypes.c_uint32 * 32)()
+        cg.CGGetActiveDisplayList(32, displays, ctypes.byref(count))
+
+        monitors = []
+        for i in range(count.value):
+            d_id = int(displays[i])
+            b = cg.CGDisplayBounds(d_id)
+            is_main = (d_id == main_id)
+            monitors.append({
+                "index": i,
+                "id": d_id,
+                "name": f"Display {i} (ID: {d_id})" + (" [Main Display]" if is_main else ""),
+                "is_primary": is_main,
+                "x": int(b.origin.x),
+                "y": int(b.origin.y),
+                "width": int(b.size.width),
+                "height": int(b.size.height),
+                "center_x": int(b.origin.x + b.size.width / 2.0),
+                "center_y": int(b.origin.y + b.size.height / 2.0),
+            })
+        if monitors:
+            return monitors
+    except Exception:
+        pass
+
+    return [{
+        "index": 0, "id": 1, "name": "Primary Display", "is_primary": True,
+        "x": 0, "y": 0, "width": 1920, "height": 1080, "center_x": 960, "center_y": 540
+    }]
+
+def center_mouse_macos(x: float, y: float, display_id: Optional[int] = None) -> bool:
+    """
+    Visibly positions the mouse cursor at (x, y) on macOS.
+    1. Uses cliclick if installed (gold standard native Cocoa tool).
+    2. Uses native CoreGraphics with zero-delta event post, cursor unhiding, and warp.
+    """
+    target_x = int(round(x))
+    target_y = int(round(y))
+
+    success = False
+
+    # Method 1: cliclick (handles remote desktop sessions like NoMachine & all displays)
+    cliclick_bins = [
+        shutil.which("cliclick"),
+        "/opt/homebrew/bin/cliclick",
+        "/usr/local/bin/cliclick"
+    ]
+    for c_bin in cliclick_bins:
+        if c_bin and os.path.exists(c_bin):
+            try:
+                res = subprocess.run([c_bin, f"m:{target_x},{target_y}"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if res.returncode == 0:
+                    success = True
+                    break
+            except Exception:
+                pass
+
+    # Method 2 & Unhide: Native CoreGraphics
+    class CGPoint(ctypes.Structure):
+        _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
+
+    try:
+        cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+        cf = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+
+        if display_id is None:
+            cg.CGMainDisplayID.restype = ctypes.c_uint32
+            display_id = cg.CGMainDisplayID()
+
+        pt = CGPoint(float(target_x), float(target_y))
+
+        cg.CGSetLocalEventsSuppressionInterval.argtypes = [ctypes.c_double]
+        cg.CGSetLocalEventsSuppressionInterval.restype = ctypes.c_int32
+        cg.CGSetLocalEventsSuppressionInterval(0.0)
+
+        cg.CGAssociateMouseAndMouseCursorPosition.argtypes = [ctypes.c_bool]
+        cg.CGAssociateMouseAndMouseCursorPosition.restype = ctypes.c_int32
+        cg.CGAssociateMouseAndMouseCursorPosition(True)
+
+        cg.CGDisplayMoveCursorToPoint.argtypes = [ctypes.c_uint32, CGPoint]
+        cg.CGDisplayMoveCursorToPoint.restype = ctypes.c_int32
+        cg.CGDisplayMoveCursorToPoint(ctypes.c_uint32(display_id), pt)
+
+        cg.CGWarpMouseCursorPosition.argtypes = [CGPoint]
+        cg.CGWarpMouseCursorPosition.restype = ctypes.c_int32
+        cg.CGWarpMouseCursorPosition(pt)
+
+        # Unhide cursor in case keyboard typing hid it
+        cg.CGDisplayShowCursor.argtypes = [ctypes.c_uint32]
+        cg.CGDisplayShowCursor.restype = ctypes.c_int32
+        cg.CGDisplayShowCursor(0)
+
+        cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
+        cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+        cg.CGEventSetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64]
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        ev = cg.CGEventCreateMouseEvent(None, 5, pt, 0)
+        if ev:
+            cg.CGEventSetIntegerValueField(ev, 4, 0) # deltaX = 0
+            cg.CGEventSetIntegerValueField(ev, 5, 0) # deltaY = 0
+            cg.CGEventPost(0, ev)
+            cf.CFRelease(ev)
+
+        success = True
+    except Exception:
+        pass
+
+    return success
+
+def get_monitors_windows() -> List[Dict[str, Any]]:
+    monitors = []
+    try:
+        user32 = ctypes.windll.user32
+        class RECT(ctypes.Structure):
+            _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long), ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+        class MONITORINFOEXW(ctypes.Structure):
+            _fields_ = [
+                ('cbSize', ctypes.c_ulong),
+                ('rcMonitor', RECT),
+                ('rcWork', RECT),
+                ('dwFlags', ctypes.c_ulong),
+                ('szDevice', ctypes.c_wchar * 32)
+            ]
+        MONITORENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(RECT), ctypes.c_void_p)
+
+        def enum_proc(hMonitor, hdcMonitor, lprcMonitor, dwData):
+            mi = MONITORINFOEXW()
+            mi.cbSize = ctypes.sizeof(MONITORINFOEXW)
+            if user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
+                is_primary = bool(mi.dwFlags & 1)
+                rc = mi.rcMonitor
+                w = rc.right - rc.left
+                h = rc.bottom - rc.top
+                monitors.append({
+                    "index": len(monitors),
+                    "id": len(monitors),
+                    "name": mi.szDevice or f"Display {len(monitors)}",
+                    "is_primary": is_primary,
+                    "x": int(rc.left),
+                    "y": int(rc.top),
+                    "width": int(w),
+                    "height": int(h),
+                    "center_x": int(rc.left + w // 2),
+                    "center_y": int(rc.top + h // 2)
+                })
+            return 1
+
+        proc = MONITORENUMPROC(enum_proc)
+        user32.EnumDisplayMonitors(None, None, proc, 0)
+    except Exception:
+        pass
+
+    if not monitors:
+        try:
+            w = ctypes.windll.user32.GetSystemMetrics(0)
+            h = ctypes.windll.user32.GetSystemMetrics(1)
+            monitors.append({
+                "index": 0, "id": 0, "name": "Primary Display", "is_primary": True,
+                "x": 0, "y": 0, "width": w, "height": h, "center_x": w // 2, "center_y": h // 2
+            })
+        except Exception:
+            monitors.append({
+                "index": 0, "id": 0, "name": "Primary Display", "is_primary": True,
+                "x": 0, "y": 0, "width": 1920, "height": 1080, "center_x": 960, "center_y": 540
+            })
+    return monitors
+
+def center_mouse_windows(x: float, y: float) -> bool:
+    try:
+        return bool(ctypes.windll.user32.SetCursorPos(int(x), int(y)))
+    except Exception:
+        return False
+
+def get_monitors_linux() -> List[Dict[str, Any]]:
+    import re
+    monitors = []
+    is_wayland = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland")
+
+    if is_wayland and shutil.which("hyprctl"):
+        try:
+            out = subprocess.check_output(["hyprctl", "monitors", "-j"], text=True, stderr=subprocess.DEVNULL)
+            data = json.loads(out)
+            for idx, m in enumerate(data):
+                monitors.append({
+                    "index": idx,
+                    "id": m.get("id", idx),
+                    "name": m.get("name", f"Display {idx}"),
+                    "is_primary": bool(m.get("focused", idx == 0)),
+                    "x": int(m.get("x", 0)),
+                    "y": int(m.get("y", 0)),
+                    "width": int(m.get("width", 1920)),
+                    "height": int(m.get("height", 1080)),
+                    "center_x": int(m.get("x", 0) + m.get("width", 1920) // 2),
+                    "center_y": int(m.get("y", 0) + m.get("height", 1080) // 2),
+                })
+            if monitors:
+                return monitors
+        except Exception:
+            pass
+
+    if is_wayland and shutil.which("swaymsg"):
+        try:
+            out = subprocess.check_output(["swaymsg", "-t", "get_outputs"], text=True, stderr=subprocess.DEVNULL)
+            data = json.loads(out)
+            for idx, m in enumerate(data):
+                rect = m.get("rect", {})
+                monitors.append({
+                    "index": idx,
+                    "id": idx,
+                    "name": m.get("name", f"Display {idx}"),
+                    "is_primary": bool(m.get("primary", idx == 0)),
+                    "x": int(rect.get("x", 0)),
+                    "y": int(rect.get("y", 0)),
+                    "width": int(rect.get("width", 1920)),
+                    "height": int(rect.get("height", 1080)),
+                    "center_x": int(rect.get("x", 0) + rect.get("width", 1920) // 2),
+                    "center_y": int(rect.get("y", 0) + rect.get("height", 1080) // 2),
+                })
+            if monitors:
+                return monitors
+        except Exception:
+            pass
+
+    if shutil.which("xrandr"):
+        try:
+            out = subprocess.check_output(["xrandr", "--query"], text=True, stderr=subprocess.DEVNULL)
+            idx = 0
+            for line in out.splitlines():
+                if " connected" in line:
+                    is_primary = " primary " in line
+                    parts = line.split()
+                    name = parts[0]
+                    geom = None
+                    for p in parts[1:]:
+                        if "x" in p and "+" in p:
+                            geom = p
+                            break
+                    if geom:
+                        m = re.match(r"(\d+)x(\d+)\+(\d+)\+(\d+)", geom)
+                        if m:
+                            w, h, x, y = map(int, m.groups())
+                            monitors.append({
+                                "index": idx,
+                                "id": idx,
+                                "name": name,
+                                "is_primary": is_primary or (idx == 0),
+                                "x": x,
+                                "y": y,
+                                "width": w,
+                                "height": h,
+                                "center_x": x + w // 2,
+                                "center_y": y + h // 2,
+                            })
+                            idx += 1
+            if monitors:
+                return monitors
+        except Exception:
+            pass
+
+    try:
+        for lib_name in ["libX11.so.6", "libX11.so"]:
+            try:
+                x11 = ctypes.cdll.LoadLibrary(lib_name)
+                disp = x11.XOpenDisplay(None)
+                if disp:
+                    screen = x11.XDefaultScreen(disp)
+                    w = x11.XDisplayWidth(disp, screen)
+                    h = x11.XDisplayHeight(disp, screen)
+                    x11.XCloseDisplay(disp)
+                    return [{
+                        "index": 0, "id": 0, "name": "Default Screen", "is_primary": True,
+                        "x": 0, "y": 0, "width": w, "height": h, "center_x": w // 2, "center_y": h // 2
+                    }]
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return [{
+        "index": 0, "id": 0, "name": "Default Display", "is_primary": True,
+        "x": 0, "y": 0, "width": 1920, "height": 1080, "center_x": 960, "center_y": 540
+    }]
+
+def center_mouse_linux(x: float, y: float) -> bool:
+    is_wayland = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland")
+    target_x = int(x)
+    target_y = int(y)
+
+    if is_wayland:
+        if shutil.which("ydotool"):
+            res = subprocess.run(["ydotool", "mousemove", "-a", str(target_x), str(target_y)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                return True
+
+        if shutil.which("hyprctl"):
+            res = subprocess.run(["hyprctl", "dispatch", "movecursor", f"{target_x} {target_y}"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                return True
+
+        if shutil.which("wlrctl"):
+            res = subprocess.run(["wlrctl", "pointer", "move", str(target_x), str(target_y)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                return True
+
+        if shutil.which("kdotool"):
+            res = subprocess.run(["kdotool", "mousemove", str(target_x), str(target_y)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                return True
+
+    for lib_name in ["libX11.so.6", "libX11.so"]:
+        try:
+            x11 = ctypes.cdll.LoadLibrary(lib_name)
+            disp = x11.XOpenDisplay(None)
+            if disp:
+                root = x11.XDefaultRootWindow(disp)
+                x11.XWarpPointer(disp, None, root, 0, 0, 0, 0, target_x, target_y)
+                x11.XFlush(disp)
+                x11.XCloseDisplay(disp)
+                return True
+        except Exception:
+            continue
+
+    if shutil.which("xdotool"):
+        res = subprocess.run(["xdotool", "mousemove", str(target_x), str(target_y)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0:
+            return True
+
+    return False
+
+def get_monitors() -> List[Dict[str, Any]]:
+    if sys.platform == "darwin":
+        return get_monitors_macos()
+    elif sys.platform == "win32":
+        return get_monitors_windows()
+    else:
+        return get_monitors_linux()
+
+def get_target_monitor(config: Dict[str, Any]) -> Dict[str, Any]:
+    monitors = get_monitors()
+    if not monitors:
+        return {
+            "index": 0, "name": "Default Display", "is_primary": True,
+            "x": 0, "y": 0, "width": 1920, "height": 1080, "center_x": 960, "center_y": 540
+        }
+
+    target_pref = config.get("target_monitor", "primary")
+
+    if target_pref == "primary":
+        for m in monitors:
+            if m.get("is_primary"):
+                return m
+        return monitors[0]
+
+    try:
+        idx = int(target_pref)
+        for m in monitors:
+            if m.get("index") == idx:
+                return m
+    except (ValueError, TypeError):
+        pass
+
+    for m in monitors:
+        if str(m.get("id")) == str(target_pref) or m.get("name") == str(target_pref):
+            return m
+
+    for m in monitors:
+        if m.get("is_primary"):
+            return m
+    return monitors[0]
+
+def center_cursor(config: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any]]:
+    """Centers the mouse cursor on the configured target monitor."""
+    if config is None:
+        config = load_config()
+    target = get_target_monitor(config)
+    cx, cy = target["center_x"], target["center_y"]
+    display_id = target.get("id")
+
+    if sys.platform == "darwin":
+        success = center_mouse_macos(cx, cy, display_id=display_id)
+    elif sys.platform == "win32":
+        success = center_mouse_windows(cx, cy)
+    else:
+        success = center_mouse_linux(cx, cy)
+
+    return success, target
+
+# ============================================================================
+# PERMANENT BACKGROUND SERVICE (INSTALLATION & REMOVAL)
+# ============================================================================
+
+MACOS_LAUNCHAGENT_LABEL = "com.mp.magicmousecentered"
+MACOS_PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{MACOS_LAUNCHAGENT_LABEL}.plist")
+LINUX_SERVICE_NAME = "mp-magic-mouse-centered.service"
+LINUX_SYSTEMD_PATH = os.path.expanduser(f"~/.config/systemd/user/{LINUX_SERVICE_NAME}")
+LINUX_AUTOSTART_PATH = os.path.expanduser("~/.config/autostart/mp-magic-mouse-centered.desktop")
+WINDOWS_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WINDOWS_REG_NAME = "MP_Magic_Mouse_Centered"
+
+def install_background_service() -> bool:
+    """Installs and enables the permanent background service for login."""
+    py_exec = sys.executable
+    script = SCRIPT_PATH
+
+    if sys.platform == "darwin":
+        try:
+            os.makedirs(os.path.dirname(MACOS_PLIST_PATH), exist_ok=True)
+            plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{MACOS_LAUNCHAGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{py_exec}</string>
+        <string>{script}</string>
+        <string>--daemon</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"""
+            with open(MACOS_PLIST_PATH, "w", encoding="utf-8") as f:
+                f.write(plist_content)
+
+            uid = os.getuid()
+            subprocess.run(["launchctl", "bootout", f"gui/{uid}/{MACOS_LAUNCHAGENT_LABEL}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            res = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", MACOS_PLIST_PATH],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode != 0:
+                subprocess.run(["launchctl", "load", "-w", MACOS_PLIST_PATH],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            return False
+
+    elif sys.platform == "win32":
+        try:
+            import winreg
+            pythonw = os.path.join(os.path.dirname(py_exec), "pythonw.exe")
+            exec_bin = pythonw if os.path.exists(pythonw) else py_exec
+            cmd = f'"{exec_bin}" "{script}" --daemon'
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, WINDOWS_REG_NAME, 0, winreg.REG_SZ, cmd)
+
+            subprocess.Popen([exec_bin, script, "--daemon"], creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+            return True
+        except Exception:
+            return False
+
+    else:
+        success = False
+        try:
+            os.makedirs(os.path.dirname(LINUX_SYSTEMD_PATH), exist_ok=True)
+            unit_content = f"""[Unit]
+Description=MP Magic Mouse Centered Service
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart={py_exec} {script} --daemon
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+"""
+            with open(LINUX_SYSTEMD_PATH, "w", encoding="utf-8") as f:
+                f.write(unit_content)
+
+            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            res = subprocess.run(["systemctl", "--user", "enable", "--now", LINUX_SERVICE_NAME],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                success = True
+        except Exception:
+            pass
+
+        try:
+            os.makedirs(os.path.dirname(LINUX_AUTOSTART_PATH), exist_ok=True)
+            desktop_content = f"""[Desktop Entry]
+Type=Application
+Name=MP Magic Mouse Centered
+Comment=Positions mouse cursor at screen center upon login and handles Alt+C
+Exec={py_exec} {script} --daemon
+Terminal=false
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+"""
+            with open(LINUX_AUTOSTART_PATH, "w", encoding="utf-8") as f:
+                f.write(desktop_content)
+            success = True
+        except Exception:
+            pass
+
+        try:
+            is_wayland = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland")
+            if is_wayland and shutil.which("gsettings"):
+                custom_path = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/mp-magic-mouse/"
+                subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
+                                "name", "MP Magic Mouse Centered"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
+                                "command", f"{py_exec} {script} --center"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
+                                "binding", "<Alt>c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        if not success:
+            try:
+                subprocess.Popen([py_exec, script, "--daemon"], start_new_session=True)
+                success = True
+            except Exception:
+                pass
+
+        return success
+
+def remove_background_service() -> bool:
+    """Removes and disables the permanent background service."""
+    success = False
+
+    if sys.platform == "darwin":
+        try:
+            uid = os.getuid()
+            subprocess.run(["launchctl", "bootout", f"gui/{uid}/{MACOS_LAUNCHAGENT_LABEL}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["launchctl", "unload", "-w", MACOS_PLIST_PATH],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(MACOS_PLIST_PATH):
+                os.remove(MACOS_PLIST_PATH)
+            success = True
+        except Exception:
+            pass
+
+    elif sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                try:
+                    winreg.DeleteValue(key, WINDOWS_REG_NAME)
+                    success = True
+                except FileNotFoundError:
+                    success = True
+        except Exception:
+            pass
+
+    else:
+        try:
+            subprocess.run(["systemctl", "--user", "disable", "--now", LINUX_SERVICE_NAME],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(LINUX_SYSTEMD_PATH):
+                os.remove(LINUX_SYSTEMD_PATH)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            success = True
+        except Exception:
+            pass
+
+        try:
+            if os.path.exists(LINUX_AUTOSTART_PATH):
+                os.remove(LINUX_AUTOSTART_PATH)
+                success = True
+        except Exception:
+            pass
+
+        try:
+            if shutil.which("gsettings"):
+                custom_path = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/mp-magic-mouse/"
+                subprocess.run(["gsettings", "reset-recursively", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    try:
+        current_pid = os.getpid()
+        if sys.platform != "win32":
+            res = subprocess.run(["pgrep", "-f", f"{SCRIPT_PATH}.*--daemon"],
+                                 capture_output=True, text=True)
+            for line in res.stdout.strip().splitlines():
+                try:
+                    pid = int(line.strip())
+                    if pid != current_pid:
+                        os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return success
+
+def is_service_installed() -> bool:
+    """Checks if background login service is installed."""
+    if sys.platform == "darwin":
+        return os.path.exists(MACOS_PLIST_PATH)
+    elif sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_REG_KEY, 0, winreg.KEY_READ) as key:
+                winreg.QueryValueEx(key, WINDOWS_REG_NAME)
+                return True
+        except Exception:
+            return False
+    else:
+        return os.path.exists(LINUX_SYSTEMD_PATH) or os.path.exists(LINUX_AUTOSTART_PATH)
+
+def is_service_running() -> bool:
+    """Checks if daemon process is currently running."""
+    try:
+        current_pid = os.getpid()
+        if sys.platform != "win32":
+            res = subprocess.run(["pgrep", "-f", f"{SCRIPT_PATH}.*--daemon"], capture_output=True, text=True)
+            pids = [int(p) for p in res.stdout.strip().splitlines() if p.strip() and int(p) != current_pid]
+            return len(pids) > 0
+        else:
+            out = subprocess.check_output('tasklist /FI "IMAGENAME eq python.exe" /FI "IMAGENAME eq pythonw.exe"',
+                                          shell=True, text=True, stderr=subprocess.DEVNULL)
+            return "python" in out.lower()
+    except Exception:
+        return False
+
+# ============================================================================
+# HOTKEY DAEMON (ALT+C LISTENER)
+# ============================================================================
+
+def run_hotkey_daemon():
+    """
+    Background daemon:
+    1. Immediately centers mouse cursor at login/startup.
+    2. Runs an ultra-efficient listener for ALT+C.
+    """
+    time.sleep(0.5)
+    config = load_config()
+    center_cursor(config)
+
+    if sys.platform == "darwin":
+        run_hotkey_darwin(config)
+    elif sys.platform == "win32":
+        run_hotkey_win32(config)
+    else:
+        run_hotkey_linux(config)
+
+def run_hotkey_darwin(config: Dict[str, Any]):
+    """
+    macOS dual hotkey listener:
+    1. EventTap on CFRunLoop:
+       Uses kCGEventTapOptionDefault to consume Alt+C and prevent the active
+       window from receiving 'ç' or hiding/repositioning the mouse cursor.
+    2. Fallback polling loop with CGEventSourceFlagsState & CGEventSourceKeyState.
+    """
+    cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+    cf = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+
+    last_trigger = [0.0]
+    lock = threading.Lock()
+
+    def trigger_hotkey():
+        with lock:
+            now = time.time()
+            if now - last_trigger[0] < 0.35: # 350ms debounce
+                return
+            last_trigger[0] = now
+            cfg = load_config()
+            center_cursor(cfg)
+            if cfg.get("sound_on_hotkey", False):
+                play_happy_sound()
+
+    # --- Listener Thread 1: CGEventTap on CFRunLoop ---
+    def event_tap_thread_func():
+        try:
+            EventTapCallback = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p)
+            cg.CGEventTapCreate.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int64, EventTapCallback, ctypes.c_void_p]
+            cg.CGEventTapCreate.restype = ctypes.c_void_p
+            cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+            cg.CGEventGetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            cg.CGEventGetIntegerValueField.restype = ctypes.c_int64
+            cg.CGEventGetFlags.argtypes = [ctypes.c_void_p]
+            cg.CGEventGetFlags.restype = ctypes.c_ulonglong
+
+            cf.CFMachPortCreateRunLoopSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
+            cf.CFMachPortCreateRunLoopSource.restype = ctypes.c_void_p
+            cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+            cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            cf.CFRunLoopRun.restype = None
+
+            tap_ref = [None]
+
+            @EventTapCallback
+            def callback(proxy, type_, event, refcon):
+                if type_ == 14: # kCGEventTapDisabledByTimeout
+                    if tap_ref[0]:
+                        cg.CGEventTapEnable(tap_ref[0], True)
+                    return event
+
+                if type_ == 10: # kCGEventKeyDown
+                    keycode = cg.CGEventGetIntegerValueField(event, 9) # kCGKeyboardEventKeycode
+                    if keycode == 8: # 'C' key on ANSI
+                        flags = cg.CGEventGetFlags(event)
+                        # Option/Alt key flag or device flags
+                        is_alt = bool(flags & 0x00080000) or bool(flags & 0x00000060)
+                        # Ensure Command is not held down (to preserve standard Cmd+C Copy)
+                        is_cmd = bool(flags & 0x00100000)
+                        if is_alt and not is_cmd:
+                            trigger_hotkey()
+                            # Return None (NULL) to consume Alt+C
+                            return None
+                return event
+
+            mask = (1 << 10) # kCGEventKeyDown
+            # Place tap with Default option (0) to allow swallowing Alt+C
+            tap = cg.CGEventTapCreate(1, 0, 0, mask, callback, None)
+            if not tap:
+                tap = cg.CGEventTapCreate(0, 0, 0, mask, callback, None)
+            if not tap:
+                tap = cg.CGEventTapCreate(1, 0, 1, mask, callback, None)
+            if not tap:
+                tap = cg.CGEventTapCreate(0, 0, 1, mask, callback, None)
+
+            if tap:
+                tap_ref[0] = tap
+                common_mode = ctypes.c_void_p.in_dll(cf, 'kCFRunLoopCommonModes').value
+                default_mode = ctypes.c_void_p.in_dll(cf, 'kCFRunLoopDefaultMode').value
+                src = cf.CFMachPortCreateRunLoopSource(None, tap, 0)
+                rl = cf.CFRunLoopGetCurrent()
+                cf.CFRunLoopAddSource(rl, src, common_mode)
+                cf.CFRunLoopAddSource(rl, src, default_mode)
+                cg.CGEventTapEnable(tap, True)
+                cf.CFRunLoopRun()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=event_tap_thread_func, daemon=True)
+    t.start()
+
+    # --- Listener Thread 2: Polling Loop with Flags & KeyState ---
+    cg.CGEventSourceKeyState.argtypes = [ctypes.c_int, ctypes.c_uint16]
+    cg.CGEventSourceKeyState.restype = ctypes.c_bool
+    cg.CGEventSourceFlagsState.argtypes = [ctypes.c_int]
+    cg.CGEventSourceFlagsState.restype = ctypes.c_ulonglong
+
+    was_down = False
+    while True:
+        try:
+            f0 = cg.CGEventSourceFlagsState(0)
+            f1 = cg.CGEventSourceFlagsState(1)
+            flags = f0 | f1
+
+            is_alt = bool(flags & 0x00080000) or cg.CGEventSourceKeyState(0, 58) or cg.CGEventSourceKeyState(0, 61) or cg.CGEventSourceKeyState(1, 58) or cg.CGEventSourceKeyState(1, 61)
+            is_cmd = bool(flags & 0x00100000) or cg.CGEventSourceKeyState(0, 55) or cg.CGEventSourceKeyState(0, 54)
+
+            c_down = cg.CGEventSourceKeyState(0, 8) or cg.CGEventSourceKeyState(1, 8)
+
+            if is_alt and c_down and not is_cmd:
+                if not was_down:
+                    was_down = True
+                    trigger_hotkey()
+            else:
+                was_down = False
+
+            time.sleep(0.035)
+        except (KeyboardInterrupt, SystemExit):
+            break
+        except Exception:
+            time.sleep(0.1)
+
+def run_hotkey_win32(config: Dict[str, Any]):
+    """Windows hotkey listener using RegisterHotKey and Win32 message loop."""
+    try:
+        user32 = ctypes.windll.user32
+        MOD_ALT = 0x0001
+        MOD_NOREPEAT = 0x4000
+        VK_C = 0x43
+        HOTKEY_ID = 101
+
+        user32.RegisterHotKey(None, HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_C)
+
+        class MSG(ctypes.Structure):
+            _fields_ = [
+                ('hwnd', ctypes.c_void_p),
+                ('message', ctypes.c_uint),
+                ('wParam', ctypes.c_void_p),
+                ('lParam', ctypes.c_void_p),
+                ('time', ctypes.c_ulong),
+                ('pt', ctypes.c_long * 2)
+            ]
+
+        msg = MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == 0x0312 and msg.wParam == HOTKEY_ID: # WM_HOTKEY
+                cfg = load_config()
+                center_cursor(cfg)
+                if cfg.get("sound_on_hotkey", False):
+                    play_happy_sound()
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    except Exception:
+        while True:
+            try:
+                alt = bool(ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000)
+                c_key = bool(ctypes.windll.user32.GetAsyncKeyState(0x43) & 0x8000)
+                if alt and c_key:
+                    cfg = load_config()
+                    center_cursor(cfg)
+                    time.sleep(0.3)
+                time.sleep(0.04)
+            except (KeyboardInterrupt, SystemExit):
+                break
+            except Exception:
+                time.sleep(0.1)
+
+def run_hotkey_linux(config: Dict[str, Any]):
+    """Linux hotkey listener for X11 & Wayland fallback."""
+    is_wayland = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland")
+
+    x11 = None
+    for lib_name in ["libX11.so.6", "libX11.so"]:
+        try:
+            x11 = ctypes.cdll.LoadLibrary(lib_name)
+            break
+        except Exception:
+            continue
+
+    if x11:
+        disp = None
+        try:
+            disp = x11.XOpenDisplay(None)
+        except Exception:
+            disp = None
+
+        if disp:
+            try:
+                root = x11.XDefaultRootWindow(disp)
+                keycode = x11.XKeysymToKeycode(disp, 0x63) # XK_c
+                Mod1Mask = 8
+                modifiers = [Mod1Mask, Mod1Mask | 2, Mod1Mask | 16, Mod1Mask | 18]
+                for mod in modifiers:
+                    x11.XGrabKey(disp, keycode, mod, root, True, 1, 1)
+
+                class XEvent(ctypes.Structure):
+                    _fields_ = [('type', ctypes.c_int), ('pad', ctypes.c_byte * 192)]
+
+                event = XEvent()
+                while True:
+                    x11.XNextEvent(disp, ctypes.byref(event))
+                    if event.type == 2: # KeyPress
+                        cfg = load_config()
+                        center_cursor(cfg)
+                        if cfg.get("sound_on_hotkey", False):
+                            play_happy_sound()
+            except (KeyboardInterrupt, SystemExit):
+                if disp:
+                    x11.XCloseDisplay(disp)
+                return
+            except Exception:
+                if disp:
+                    x11.XCloseDisplay(disp)
+
+    while True:
+        try:
+            time.sleep(1)
+        except (KeyboardInterrupt, SystemExit):
+            break
+
+# ============================================================================
+# FIRST-RUN HANDLER
+# ============================================================================
+
+def handle_first_run(config: Dict[str, Any]) -> bool:
+    """
+    Executes first-run initialization:
+    - Centers mouse cursor immediately
+    - Displays required first-time message
+    - Plays generated happy alert sound
+    - Automatically installs permanent background service
+    """
+    success, target = center_cursor(config)
+
+    message = "You will never need to find your Mouse Cursor every again because it will always be in the Center of your Primary Screen when you login to your Desktop."
+    print("\n" + "=" * 80)
+    print(message)
+    print("=" * 80 + "\n")
+
+    play_happy_sound()
+
+    print("[+] Automatically installing permanent background service...")
+    installed = install_background_service()
+    config["first_run_completed"] = True
+    config["service_installed"] = installed
+    save_config(config)
+
+    if installed:
+        print("[+] Permanent background service successfully installed and activated!")
+        print("[+] Mouse cursor will automatically center on login.")
+        print("[+] Global shortcut ALT+C is now active for instant centering.")
+    else:
+        print("[!] Background service installation encountered an issue. You can manage it from the menu.")
+
+    print(f"\n[OK] Centered on: {target.get('name', 'Primary Display')} ({target.get('width')}x{target.get('height')})")
+    print(f"[OK] Configuration saved to: {get_config_path()}\n")
+    return True
+
+# ============================================================================
+# CLI INTERACTIVE MENU
+# ============================================================================
+
+def configure_target_monitor_menu():
+    """Interactive menu to select and save target monitor."""
+    config = load_config()
+    monitors = get_monitors()
+
+    print("\n" + "-" * 60)
+    print("           CONFIGURE TARGET MONITOR")
+    print("-" * 60)
+    print(f"Current setting: {config.get('target_monitor', 'primary')}\n")
+    print("Available Displays:")
+    print("  [P] Primary / Main Screen (Default)")
+    for m in monitors:
+        idx = m["index"]
+        name = m["name"]
+        w, h = m["width"], m["height"]
+        primary_str = " (Primary)" if m.get("is_primary") else ""
+        print(f"  [{idx}] {name}: {w}x{h} at ({m['x']},{m['y']}){primary_str}")
+
+    print("  [C] Cancel / Back")
+    print("-" * 60)
+    choice = input("Enter choice [P, 0, 1, ...]: ").strip()
+
+    if choice.upper() == 'P':
+        config["target_monitor"] = "primary"
+        save_config(config)
+        print("[+] Target monitor set to: Primary Display")
+        center_cursor(config)
+    elif choice.isdigit():
+        idx = int(choice)
+        if any(m["index"] == idx for m in monitors):
+            config["target_monitor"] = idx
+            save_config(config)
+            print(f"[+] Target monitor set to: Display {idx}")
+            center_cursor(config)
+        else:
+            print("[!] Invalid display index.")
+    elif choice.upper() == 'C':
+        print("[*] Configuration unchanged.")
+    else:
+        print("[!] Invalid option.")
+
+def show_status():
+    """Displays current system status, monitor details, and service status."""
+    config = load_config()
+    monitors = get_monitors()
+    target = get_target_monitor(config)
+    installed = is_service_installed()
+    running = is_service_running()
+
+    print("\n" + "=" * 65)
+    print("             MP MAGIC MOUSE CENTERED - STATUS")
+    print("=" * 65)
+    print(f"Operating System   : {sys.platform} ({'Wayland' if os.environ.get('WAYLAND_DISPLAY') else 'Standard'})")
+    print(f"Config File        : {get_config_path()}")
+    print(f"Target Monitor     : {config.get('target_monitor', 'primary')} -> [{target.get('name', 'Unknown')}]")
+    print(f"Target Center Coords: X={target.get('center_x')}, Y={target.get('center_y')}")
+    print(f"Shortcut Key       : {config.get('shortcut', 'Alt+C')}")
+    print(f"Sound Enabled      : {config.get('sound_enabled', True)}")
+    print(f"Sound on Alt+C     : {config.get('sound_on_hotkey', False)}")
+    print(f"Service Installed  : {'YES' if installed else 'NO'}")
+    print(f"Service Running    : {'ACTIVE / RUNNING' if (running or installed) else 'STOPPED'}")
+    print("-" * 65)
+    print("Connected Displays:")
+    for m in monitors:
+        main_flag = " [Primary]" if m.get("is_primary") else ""
+        print(f"  * Display {m['index']}: {m['width']}x{m['height']} at ({m['x']},{m['y']}){main_flag}")
+    print("=" * 65 + "\n")
+
+def run_interactive_menu():
+    """Main CLI interactive menu loop."""
+    while True:
+        config = load_config()
+        installed = is_service_installed()
+
+        print("\n" + "=" * 65)
+        print("                 MP MAGIC MOUSE CENTERED")
+        print("=" * 65)
+        print(" [1] Center Mouse Cursor Now")
+        print(" [2] Configure Target Monitor (Multi-Display Setup)")
+        print(f" [3] Install / Enable Background Login Service & Hotkey (Alt+C) [{'ACTIVE' if installed else 'DISABLED'}]")
+        print(" [4] Remove & Disable Mouse Centering Service")
+        print(" [5] Test Happy Alert Sound")
+        print(f" [6] Toggle Alert Sound on Shortcut (Alt+C) [{'ENABLED' if config.get('sound_on_hotkey', False) else 'DISABLED'}]")
+        print(" [7] View Current Configuration & Service Status")
+        print(" [0] Exit")
+        print("=" * 65)
+
+        try:
+            choice = input("Select an option [0-7]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+            break
+
+        if choice == "1":
+            success, target = center_cursor(config)
+            if success:
+                print(f"[OK] Mouse cursor centered on {target.get('name')} at ({target['center_x']}, {target['center_y']})")
+            else:
+                print("[!] Failed to move mouse cursor.")
+        elif choice == "2":
+            configure_target_monitor_menu()
+        elif choice == "3":
+            print("[*] Installing background login service...")
+            if install_background_service():
+                config["service_installed"] = True
+                save_config(config)
+                print("[+] Background service installed and enabled!")
+                print("[+] Cursor will automatically center on login, and ALT+C is active.")
+            else:
+                print("[!] Failed to install background service.")
+        elif choice == "4":
+            print("[*] Removing and disabling background service...")
+            if remove_background_service():
+                config["service_installed"] = False
+                save_config(config)
+                print("[+] Background service has been successfully removed and disabled.")
+            else:
+                print("[!] Encountered an issue while removing service.")
+        elif choice == "5":
+            print("[*] Playing happy alert sound...")
+            play_happy_sound()
+            print("[OK] Sound played.")
+        elif choice == "6":
+            curr = config.get("sound_on_hotkey", False)
+            config["sound_on_hotkey"] = not curr
+            save_config(config)
+            print(f"[+] Sound on Alt+C is now: {'ENABLED' if not curr else 'DISABLED'}")
+        elif choice == "7":
+            show_status()
+        elif choice == "0":
+            print("Goodbye!")
+            break
+        else:
+            print("[!] Invalid selection. Please enter a number between 0 and 7.")
+
+# ============================================================================
+# MAIN ENTRYPOINT
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="MP Magic Mouse Centered - Automatically centers cursor on login and with Alt+C shortcut."
+    )
+    parser.add_argument("--center", action="store_true", help="Immediately center the mouse cursor and exit.")
+    parser.add_argument("--daemon", action="store_true", help="Run background daemon service (centers cursor on login, listens for Alt+C).")
+    parser.add_argument("--install", action="store_true", help="Install and enable permanent background login service.")
+    parser.add_argument("--uninstall", action="store_true", help="Remove and disable background login service.")
+    parser.add_argument("--status", action="store_true", help="Display service and configuration status.")
+    parser.add_argument("--list-monitors", action="store_true", help="List all detected monitors and their geometries.")
+    parser.add_argument("--set-monitor", type=str, help="Set target monitor ('primary' or display index 0, 1, ...).")
+    parser.add_argument("--play-sound", action="store_true", help="Play the generated happy alert sound.")
+    parser.add_argument("--menu", action="store_true", help="Launch interactive CLI menu directly.")
+
+    args = parser.parse_args()
+    config = load_config()
+
+    if args.daemon:
+        run_hotkey_daemon()
+        return
+
+    if args.center:
+        success, target = center_cursor(config)
+        if success:
+            print(f"Cursor centered on {target.get('name')} at ({target['center_x']}, {target['center_y']})")
+        else:
+            sys.exit(1)
+        return
+
+    if args.install:
+        if install_background_service():
+            config["service_installed"] = True
+            save_config(config)
+            print("Background service installed and enabled.")
+        else:
+            sys.exit(1)
+        return
+
+    if args.uninstall:
+        if remove_background_service():
+            config["service_installed"] = False
+            save_config(config)
+            print("Background service successfully removed and disabled.")
+        else:
+            sys.exit(1)
+        return
+
+    if args.status:
+        show_status()
+        return
+
+    if args.list_monitors:
+        monitors = get_monitors()
+        print("Connected Displays:")
+        for m in monitors:
+            p = " [Primary]" if m.get("is_primary") else ""
+            print(f"  [{m['index']}] {m['name']}: {m['width']}x{m['height']} at ({m['x']},{m['y']}){p}")
+        return
+
+    if args.set_monitor:
+        val = args.set_monitor.strip()
+        if val.lower() == "primary":
+            config["target_monitor"] = "primary"
+        else:
+            try:
+                config["target_monitor"] = int(val)
+            except ValueError:
+                config["target_monitor"] = val
+        save_config(config)
+        print(f"Target monitor updated to: {config['target_monitor']}")
+        center_cursor(config)
+        return
+
+    if args.play_sound:
+        play_happy_sound()
+        return
+
+    if not config.get("first_run_completed", False):
+        handle_first_run(config)
+        if sys.stdin.isatty():
+            try:
+                res = input("Would you like to open the CLI management menu? [Y/n]: ").strip().lower()
+                if res in ("", "y", "yes"):
+                    run_interactive_menu()
+            except (KeyboardInterrupt, EOFError):
+                pass
+        return
+
+    if sys.stdin.isatty() or args.menu:
+        run_interactive_menu()
+    else:
+        center_cursor(config)
+
+if __name__ == "__main__":
+    main()

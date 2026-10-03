@@ -1,0 +1,8 @@
+{
+    "target_monitor": "primary",
+    "first_run_completed": false,
+    "service_installed": false,
+    "sound_enabled": true,
+    "sound_on_hotkey": false,
+    "shortcut": "Alt+C"
+}
