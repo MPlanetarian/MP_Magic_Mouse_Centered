@@ -391,6 +391,44 @@ def get_monitors_linux() -> List[Dict[str, Any]]:
         except Exception:
             pass
 
+    # KDE Plasma (Wayland / X11 via KScreen)
+    if shutil.which("kscreen-doctor"):
+        try:
+            out = subprocess.check_output(["kscreen-doctor", "-j"], text=True, stderr=subprocess.DEVNULL)
+            data = json.loads(out)
+            outputs = data.get("outputs", [])
+            for o in outputs:
+                if not o.get("connected") or not o.get("enabled"):
+                    continue
+                name = o.get("name", f"Display {len(monitors)}")
+                is_primary = (o.get("priority") == 1)
+                pos = o.get("pos", {})
+                size = o.get("size", {})
+                scale = float(o.get("scale", 1.0)) or 1.0
+                w = int(round(size.get("width", 1920) / scale))
+                h = int(round(size.get("height", 1080) / scale))
+                x = int(pos.get("x", 0))
+                y = int(pos.get("y", 0))
+                monitors.append({
+                    "index": len(monitors),
+                    "id": o.get("id", len(monitors)),
+                    "name": name,
+                    "is_primary": is_primary,
+                    "x": x,
+                    "y": y,
+                    "width": w,
+                    "height": h,
+                    "scale": scale,
+                    "center_x": x + w // 2,
+                    "center_y": y + h // 2,
+                })
+            if monitors:
+                if not any(m["is_primary"] for m in monitors):
+                    monitors[0]["is_primary"] = True
+                return monitors
+        except Exception:
+            pass
+
     if shutil.which("xrandr"):
         try:
             out = subprocess.check_output(["xrandr", "--query"], text=True, stderr=subprocess.DEVNULL)
@@ -413,7 +451,7 @@ def get_monitors_linux() -> List[Dict[str, Any]]:
                                 "index": idx,
                                 "id": idx,
                                 "name": name,
-                                "is_primary": is_primary or (idx == 0),
+                                "is_primary": is_primary,
                                 "x": x,
                                 "y": y,
                                 "width": w,
@@ -423,6 +461,8 @@ def get_monitors_linux() -> List[Dict[str, Any]]:
                             })
                             idx += 1
             if monitors:
+                if not any(m["is_primary"] for m in monitors):
+                    monitors[0]["is_primary"] = True
                 return monitors
         except Exception:
             pass
@@ -453,13 +493,20 @@ def get_monitors_linux() -> List[Dict[str, Any]]:
 
 def center_mouse_linux(x: float, y: float) -> bool:
     is_wayland = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland")
-    target_x = int(x)
-    target_y = int(y)
+    target_x = int(round(x))
+    target_y = int(round(y))
 
     if is_wayland:
         if shutil.which("ydotool"):
+            env = os.environ.copy()
+            uid = os.getuid()
+            if "YDOTOOL_SOCKET" not in env:
+                for sock in [f"/run/user/{uid}/.ydotool_socket", "/tmp/.ydotool_socket"]:
+                    if os.path.exists(sock):
+                        env["YDOTOOL_SOCKET"] = sock
+                        break
             res = subprocess.run(["ydotool", "mousemove", "-a", str(target_x), str(target_y)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if res.returncode == 0:
                 return True
 
@@ -484,10 +531,21 @@ def center_mouse_linux(x: float, y: float) -> bool:
     for lib_name in ["libX11.so.6", "libX11.so"]:
         try:
             x11 = ctypes.cdll.LoadLibrary(lib_name)
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            x11.XWarpPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_int]
+            x11.XWarpPointer.restype = ctypes.c_int
+            x11.XFlush.argtypes = [ctypes.c_void_p]
+            x11.XFlush.restype = ctypes.c_int
+            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            x11.XCloseDisplay.restype = ctypes.c_int
+
             disp = x11.XOpenDisplay(None)
             if disp:
                 root = x11.XDefaultRootWindow(disp)
-                x11.XWarpPointer(disp, None, root, 0, 0, 0, 0, target_x, target_y)
+                x11.XWarpPointer(disp, 0, root, 0, 0, 0, 0, target_x, target_y)
                 x11.XFlush(disp)
                 x11.XCloseDisplay(disp)
                 return True
@@ -518,9 +576,9 @@ def get_target_monitor(config: Dict[str, Any]) -> Dict[str, Any]:
             "x": 0, "y": 0, "width": 1920, "height": 1080, "center_x": 960, "center_y": 540
         }
 
-    target_pref = config.get("target_monitor", "primary")
+    target_pref = str(config.get("target_monitor", "primary")).strip()
 
-    if target_pref == "primary":
+    if target_pref.lower() == "primary":
         for m in monitors:
             if m.get("is_primary"):
                 return m
@@ -534,8 +592,11 @@ def get_target_monitor(config: Dict[str, Any]) -> Dict[str, Any]:
     except (ValueError, TypeError):
         pass
 
+    clean_pref = target_pref.lower().replace("-", "").replace("_", "").replace(" ", "")
     for m in monitors:
-        if str(m.get("id")) == str(target_pref) or m.get("name") == str(target_pref):
+        m_name = str(m.get("name", "")).lower().replace("-", "").replace("_", "").replace(" ", "")
+        m_id = str(m.get("id", "")).lower()
+        if m_name == clean_pref or m_id == target_pref.lower() or str(m.get("name", "")).lower() == target_pref.lower():
             return m
 
     for m in monitors:
@@ -684,14 +745,39 @@ X-GNOME-Autostart-enabled=true
 
         try:
             is_wayland = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland")
-            if is_wayland and shutil.which("gsettings"):
-                custom_path = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/mp-magic-mouse/"
-                subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
-                                "name", "MP Magic Mouse Centered"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
-                                "command", f"{py_exec} {script} --center"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
-                                "binding", "<Alt>c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if is_wayland:
+                # GNOME Custom Shortcut
+                if shutil.which("gsettings"):
+                    custom_path = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/mp-magic-mouse/"
+                    subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
+                                    "name", "MP Magic Mouse Centered"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
+                                    "command", f"{py_exec} {script} --center"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["gsettings", "set", f"org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{custom_path}",
+                                    "binding", "<Alt>c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # KDE Plasma Global Shortcut
+                apps_dir = os.path.expanduser("~/.local/share/applications")
+                os.makedirs(apps_dir, exist_ok=True)
+                kde_desktop = os.path.join(apps_dir, "mp-magic-mouse-centered.desktop")
+                with open(kde_desktop, "w", encoding="utf-8") as f:
+                    f.write(f"""[Desktop Entry]
+Type=Application
+Name=MP Magic Mouse Centered
+Comment=Positions mouse cursor at screen center
+Exec={py_exec} {script} --center
+Icon=input-mouse
+Terminal=false
+Categories=Utility;
+X-KDE-Shortcuts=Alt+C
+""")
+                for kw in ["kwriteconfig6", "kwriteconfig5"]:
+                    if shutil.which(kw):
+                        subprocess.run([kw, "--file", "kglobalshortcutsrc", "--group", "services",
+                                        "--group", "mp-magic-mouse-centered.desktop", "--key", "_launch",
+                                        "Alt+C,Alt+C,MP Magic Mouse Centered"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        break
         except Exception:
             pass
 
@@ -759,6 +845,19 @@ def remove_background_service() -> bool:
         except Exception:
             pass
 
+        try:
+            kde_desktop = os.path.expanduser("~/.local/share/applications/mp-magic-mouse-centered.desktop")
+            if os.path.exists(kde_desktop):
+                os.remove(kde_desktop)
+            for kw in ["kwriteconfig6", "kwriteconfig5"]:
+                if shutil.which(kw):
+                    subprocess.run([kw, "--file", "kglobalshortcutsrc", "--group", "services",
+                                    "--group", "mp-magic-mouse-centered.desktop", "--key", "_launch", "none,none,none"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    break
+        except Exception:
+            pass
+
     try:
         current_pid = os.getpid()
         if sys.platform != "win32":
@@ -814,11 +913,20 @@ def run_hotkey_daemon():
     """
     Background daemon:
     1. Immediately centers mouse cursor at login/startup.
-    2. Runs an ultra-efficient listener for ALT+C.
+    2. Runs follow-up centering after multi-monitor geometry settles on login.
+    3. Runs an ultra-efficient listener for ALT+C.
     """
-    time.sleep(0.5)
     config = load_config()
+    time.sleep(1.0)
     center_cursor(config)
+
+    # In Wayland / multi-monitor setups, compositor outputs take 2-3s to settle during desktop login
+    def delayed_login_center():
+        time.sleep(2.5)
+        cfg = load_config()
+        center_cursor(cfg)
+
+    threading.Thread(target=delayed_login_center, daemon=True).start()
 
     if sys.platform == "darwin":
         run_hotkey_darwin(config)
@@ -1012,6 +1120,27 @@ def run_hotkey_linux(config: Dict[str, Any]):
     if x11:
         disp = None
         try:
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+            x11.XGrabKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            x11.XGrabKey.restype = ctypes.c_int
+            x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            x11.XNextEvent.restype = ctypes.c_int
+            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            x11.XCloseDisplay.restype = ctypes.c_int
+
+            ErrorHandler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+            @ErrorHandler
+            def _err_handler(d, e):
+                return 0
+            x11.XSetErrorHandler.argtypes = [ErrorHandler]
+            x11.XSetErrorHandler.restype = ctypes.c_void_p
+            x11.XSetErrorHandler(_err_handler)
+
             disp = x11.XOpenDisplay(None)
         except Exception:
             disp = None
